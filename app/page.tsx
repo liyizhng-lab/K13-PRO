@@ -7,13 +7,13 @@ import { supabase } from './lib/supabase'
 import { 
   Activity, DollarSign, BarChart3, TrendingUp, Target, 
   CloudUpload, Calendar as CalIcon, Eye, X, Trash2, Edit, PieChart, 
-  BookOpen, PlayCircle, Layers
+  BookOpen, PlayCircle, Layers, Plus
 } from 'lucide-react'
 
 // 動態引入圖表
 const TradeChart = dynamic(() => import('./components/TradeChart'), { ssr: false })
 
-// 策略與模型定義
+// 預設策略與模型定義
 const STRATEGY_OPTIONS: any = {
   'ICT (Smart Money)': {
     models: ['2022 Model', 'Silver Bullet (銀彈)', 'Unicorn (獨角獸)', 'Breaker Block', 'MMXM', 'Judas Swing', 'Power of 3 (AMD)', 'Turtle Soup (殺龜)'],
@@ -42,16 +42,17 @@ export default function Home() {
   const [uploading, setUploading] = useState(false)
   const [showCalendar, setShowCalendar] = useState(true)
   const [selectedImage, setSelectedImage] = useState<string | null>(null)
-  
-  // 🔥 日記閱讀模式
   const [readingNote, setReadingNote] = useState<string | null>(null)
 
   const [accountBalance, setAccountBalance] = useState('10000')
   const [riskPercent, setRiskPercent] = useState('1')
-
-  // 🔥 模擬器設定
   const [showSim, setShowSim] = useState(false)
   const [simRisk, setSimRisk] = useState('1')
+
+  // 🔥 自訂欄位狀態
+  const [customStrategyInput, setCustomStrategyInput] = useState('')
+  const [customModelInput, setCustomModelInput] = useState('')
+  const [customConfluenceInput, setCustomConfluenceInput] = useState('')
 
   // 表單資料
   const [formData, setFormData] = useState({
@@ -60,8 +61,7 @@ export default function Home() {
     strategy_type: 'ICT (Smart Money)', entry_model: '', 
     session: 'NY AM (美初)', timeframe: '15m', mental_state: 'Flow State (心流)', 
     confluences: [] as string[], 
-    pnl_net: '', planned_rr: '', entry_date: '',
-    notes: ''
+    pnl_net: '', planned_rr: '', entry_date: '', notes: ''
   })
 
   const [stats, setStats] = useState({ totalPnl: 0, winRate: 0, totalTrades: 0, avgRR: 0 })
@@ -75,7 +75,7 @@ export default function Home() {
     fetchData()
   }, [])
 
-  // 風控計算機
+  // 風控與 RR 計算機
   useEffect(() => {
     if (formData.entry_price && formData.stop_loss && accountBalance && riskPercent) {
       const entry = parseFloat(formData.entry_price); const sl = parseFloat(formData.stop_loss)
@@ -111,12 +111,9 @@ export default function Home() {
   function calculateStats(data: any[]) {
     const totalPnl = data.reduce((acc, curr) => acc + (curr.pnl_net || 0), 0)
     const winRate = data.length > 0 ? (data.filter(t => (t.pnl_net || 0) > 0).length / data.length) * 100 : 0
-    const avgRR = data.length > 0 ? data.reduce((acc, curr) => acc + (curr.planned_rr || 0), 0) / data.length : 0
-    setStats({ totalPnl, winRate, totalTrades: data.length, avgRR })
     
-    const stratMap: any = {}
-    const calMap: Record<string, number> = {}
-    const rList: number[] = []
+    const stratMap: any = {}; const calMap: Record<string, number> = {}; const rList: number[] = []
+    let totalActualRR = 0; let rrCount = 0;
 
     data.forEach(t => {
       if(t.entry_date) {
@@ -125,21 +122,23 @@ export default function Home() {
       }
       const type = t.strategy_type || 'Unknown'
       if(!stratMap[type]) stratMap[type] = { wins: 0, total: 0, pnl: 0 }
-      stratMap[type].total++
-      stratMap[type].pnl += (t.pnl_net || 0)
+      stratMap[type].total++; stratMap[type].pnl += (t.pnl_net || 0)
       if((t.pnl_net || 0) > 0) stratMap[type].wins++
 
-      let r = 0;
-      if (t.entry_price && t.stop_loss && t.position_size) {
+      // 使用資料庫存的 actual_rr 或重新計算
+      let r = t.actual_rr || 0;
+      if (!r && t.entry_price && t.stop_loss && t.position_size) {
           const riskAmt = Math.abs(t.entry_price - t.stop_loss) * t.position_size
           if (riskAmt > 0) r = (t.pnl_net / riskAmt)
       }
       if (r > 10) r = 10; if (r < -5) r = -5;
       rList.push(r)
+      if (isFinite(r)) { totalActualRR += r; rrCount++; }
     })
-    setStrategyStats(stratMap)
-    setCalendarData(calMap)
-    setRMultiples(rList.reverse())
+    
+    const avgRR = rrCount > 0 ? totalActualRR / rrCount : 0
+    setStats({ totalPnl, winRate, totalTrades: data.length, avgRR })
+    setStrategyStats(stratMap); setCalendarData(calMap); setRMultiples(rList.reverse())
   }
 
   const toggleConfluence = (item: string) => {
@@ -147,6 +146,16 @@ export default function Home() {
       const exists = prev.confluences.includes(item)
       return { ...prev, confluences: exists ? prev.confluences.filter(i => i !== item) : [...prev.confluences, item] }
     })
+  }
+
+  // 🔥 處理手動新增共振因素
+  const addCustomConfluence = () => {
+    if (!customConfluenceInput.trim()) return
+    const newItem = customConfluenceInput.trim()
+    if (!formData.confluences.includes(newItem)) {
+        setFormData(prev => ({ ...prev, confluences: [...prev.confluences, newItem] }))
+    }
+    setCustomConfluenceInput('')
   }
 
   async function handleImageUpload(e: any) {
@@ -168,11 +177,21 @@ export default function Home() {
     e.preventDefault()
     if (!accountId) return alert("System Error: No Account ID")
     
+    // 🔥 計算實際損益比 (Actual RR)
     let actualRR = 0
-    if (formData.entry_price && formData.exit_price && formData.stop_loss) {
+    if (formData.entry_price && formData.stop_loss && formData.pnl_net && formData.position_size) {
+        // RR = 淨利 / 總風險金額
+        const riskAmt = Math.abs(parseFloat(formData.entry_price) - parseFloat(formData.stop_loss)) * parseFloat(formData.position_size)
+        if (riskAmt > 0) actualRR = parseFloat(formData.pnl_net) / riskAmt
+    } else if (formData.entry_price && formData.exit_price && formData.stop_loss) {
+        // 如果沒填 PnL 但有填出場價
         const entry = parseFloat(formData.entry_price); const exit = parseFloat(formData.exit_price); const sl = parseFloat(formData.stop_loss)
         actualRR = formData.direction === 'LONG' ? (exit - entry) / (entry - sl) : (entry - exit) / (sl - entry)
     }
+
+    // 判斷是否使用自訂策略/模型
+    const finalStrategy = formData.strategy_type === 'Custom' ? customStrategyInput || 'Custom' : formData.strategy_type
+    const finalModel = formData.entry_model === 'Custom' ? customModelInput || 'Custom' : formData.entry_model
 
     const tradeData = {
       account_id: accountId, symbol: formData.symbol.toUpperCase(), direction: formData.direction,
@@ -181,7 +200,7 @@ export default function Home() {
       position_size: parseFloat(formData.position_size)||0, pnl_net: parseFloat(formData.pnl_net)||0,
       planned_rr: parseFloat(formData.planned_rr)||0, actual_rr: isFinite(actualRR) ? actualRR : 0,
       screenshot_url: formData.screenshot_url,
-      strategy_type: formData.strategy_type, entry_model: formData.entry_model,
+      strategy_type: finalStrategy, entry_model: finalModel,
       session: formData.session, timeframe: formData.timeframe, mental_state: formData.mental_state,
       confluences: formData.confluences, notes: formData.notes,
       entry_date: formData.entry_date, status: (parseFloat(formData.pnl_net)||0)>0 ? 'WIN':'LOSS'
@@ -191,7 +210,8 @@ export default function Home() {
     else await supabase.from('trades').insert([tradeData])
     
     setShowForm(false); setEditingId(null); fetchData()
-    setFormData({...formData, symbol:'', pnl_net:'', screenshot_url:'', entry_price:'', exit_price:'', stop_loss:'', take_profit:'', position_size:'', planned_rr: '', confluences: [], notes: ''})
+    setFormData({...formData, symbol:'', pnl_net:'', screenshot_url:'', entry_price:'', exit_price:'', stop_loss:'', take_profit:'', position_size:'', planned_rr: '', confluences: [], notes: '', strategy_type: 'ICT (Smart Money)', entry_model: ''})
+    setCustomStrategyInput(''); setCustomModelInput('')
   }
 
   const handleDelete = async (id: number) => {
@@ -200,39 +220,31 @@ export default function Home() {
 
   const getChartData = () => {
     const sorted = [...trades].sort((a,b) => new Date(a.entry_date).getTime() - new Date(b.entry_date).getTime())
-    let running = 0
-    let simBalance = 10000 
-    
+    let running = 0; let simBalance = 10000 
     return sorted.map(t => { 
         running += (t.pnl_net || 0);
-        let r = 0;
-        if (t.entry_price && t.stop_loss && t.position_size) {
+        let r = t.actual_rr || 0;
+        if (!r && t.entry_price && t.stop_loss && t.position_size) {
             const riskAmt = Math.abs(t.entry_price - t.stop_loss) * t.position_size
             if (riskAmt > 0) r = (t.pnl_net / riskAmt)
         }
         const riskAmount = simBalance * (parseFloat(simRisk) / 100)
-        const simPnL = riskAmount * r
-        simBalance += simPnL
-
-        return { 
-            date: t.entry_date, 
-            pnl: running,
-            simPnl: showSim ? (simBalance - 10000) : null
-        } 
+        simBalance += (riskAmount * r)
+        return { date: t.entry_date, pnl: running, simPnl: showSim ? (simBalance - 10000) : null } 
     })
   }
 
   const currentModels = STRATEGY_OPTIONS[formData.strategy_type]?.models || []
   const currentConfluences = STRATEGY_OPTIONS[formData.strategy_type]?.confluences || []
 
-  if (!isMounted) return <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">Loading K13 V17 PRO...</div>
+  if (!isMounted) return <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">Loading K13 V17.5 PRO...</div>
 
   return (
     <main className="min-h-screen bg-slate-950 text-white p-4 md:p-8 font-sans">
       <div className="flex justify-between items-center mb-8">
         <div>
            <h1 className="text-3xl font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent">K13 Trading Journal</h1>
-           <p className="text-xs text-slate-500 font-mono mt-1">V17.0 PRO | R-Heatmap & Simulator</p>
+           <p className="text-xs text-slate-500 font-mono mt-1">V17.5 PRO | Customizable & Auto-RR</p>
         </div>
         <button onClick={() => setShowForm(!showForm)} className="bg-emerald-600 px-4 py-2 rounded font-bold hover:bg-emerald-500 transition shadow-lg shadow-emerald-900/20">
           {showForm ? 'Cancel' : '+ New Trade'}
@@ -262,30 +274,47 @@ export default function Home() {
               <div><label className="text-xs text-slate-400 block mb-1">Timeframe</label><select className="w-full bg-slate-950 border border-slate-700 rounded p-2 text-sm" value={formData.timeframe} onChange={e=>setFormData({...formData, timeframe: e.target.value})}>{TIMEFRAMES.map(t=><option key={t} value={t}>{t}</option>)}</select></div>
             </div>
 
+            {/* 🔥 自訂策略與模型區塊 */}
             <div className="bg-slate-950/50 p-4 rounded-lg border border-slate-800">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                     <div>
-                        <label className="text-xs text-blue-400 block mb-1 font-bold">Strategy</label>
-                        <select className="w-full bg-slate-900 border border-blue-500/50 rounded p-2 text-sm" value={formData.strategy_type} onChange={e=>{setFormData({...formData, strategy_type: e.target.value, entry_model: '', confluences: []})}}>
+                        <label className="text-xs text-blue-400 block mb-1 font-bold">Strategy (策略)</label>
+                        <select className="w-full bg-slate-900 border border-blue-500/50 rounded p-2 text-sm mb-2" value={formData.strategy_type} onChange={e=>{setFormData({...formData, strategy_type: e.target.value, entry_model: '', confluences: []})}}>
                             {Object.keys(STRATEGY_OPTIONS).map(s=><option key={s} value={s}>{s}</option>)}
+                            <option value="Custom">➕ Custom (自訂策略)</option>
                         </select>
+                        {formData.strategy_type === 'Custom' && (
+                            <input type="text" placeholder="輸入自訂策略名稱..." className="w-full bg-slate-800 border border-blue-500/50 rounded p-2 text-sm" value={customStrategyInput} onChange={e=>setCustomStrategyInput(e.target.value)} required/>
+                        )}
                     </div>
                     <div>
-                        <label className="text-xs text-slate-400 block mb-1">Entry Model</label>
-                        <select className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm" value={formData.entry_model} onChange={e=>setFormData({...formData, entry_model: e.target.value})}>
+                        <label className="text-xs text-slate-400 block mb-1">Entry Model (模型)</label>
+                        <select className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-sm mb-2" value={formData.entry_model} onChange={e=>setFormData({...formData, entry_model: e.target.value})}>
                             <option value="">-- Select Model --</option>
                             {currentModels.map((m:string)=><option key={m} value={m}>{m}</option>)}
+                            <option value="Custom">➕ Custom (自訂模型)</option>
                         </select>
+                        {formData.entry_model === 'Custom' && (
+                            <input type="text" placeholder="輸入自訂模型名稱..." className="w-full bg-slate-800 border border-slate-500 rounded p-2 text-sm" value={customModelInput} onChange={e=>setCustomModelInput(e.target.value)} required/>
+                        )}
                     </div>
                 </div>
+
+                {/* 🔥 自訂共振因素區塊 */}
                 <div>
-                    <label className="text-xs text-slate-400 block mb-2">Confluences</label>
-                    <div className="flex flex-wrap gap-2">
-                        {currentConfluences.map((c:string) => (
-                            <div key={c} onClick={()=>toggleConfluence(c)} className={`cursor-pointer px-3 py-1 rounded text-xs border ${formData.confluences.includes(c) ? 'bg-emerald-900/50 border-emerald-500 text-emerald-400' : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-slate-500'}`}>
+                    <label className="text-xs text-slate-400 block mb-2">Confluences (共振因素)</label>
+                    <div className="flex flex-wrap gap-2 mb-3">
+                        {/* 顯示預設共振與已添加的共振 */}
+                        {[...new Set([...currentConfluences, ...formData.confluences])].map((c:any) => (
+                            <div key={c} onClick={()=>toggleConfluence(c)} className={`cursor-pointer px-3 py-1 rounded text-xs border transition-colors ${formData.confluences.includes(c) ? 'bg-emerald-900/50 border-emerald-500 text-emerald-400' : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-slate-500'}`}>
                                 {c}
                             </div>
                         ))}
+                    </div>
+                    {/* 添加按鈕 */}
+                    <div className="flex items-center gap-2 max-w-sm">
+                        <input type="text" placeholder="輸入其他共振因素..." className="flex-1 bg-slate-900 border border-slate-700 rounded p-1.5 text-xs outline-none focus:border-emerald-500" value={customConfluenceInput} onChange={e=>setCustomConfluenceInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault(); addCustomConfluence()}}}/>
+                        <button type="button" onClick={addCustomConfluence} className="bg-slate-800 p-1.5 rounded hover:bg-slate-700 text-slate-400 hover:text-white transition"><Plus className="w-4 h-4"/></button>
                     </div>
                 </div>
             </div>
@@ -305,12 +334,7 @@ export default function Home() {
 
             <div>
                <label className="text-xs text-slate-400 block mb-1">Journal Notes</label>
-               <textarea 
-                  className="w-full bg-slate-950 border border-slate-700 rounded p-3 text-sm h-32 focus:border-emerald-500 outline-none" 
-                  placeholder="為什麼進場？執行上有什麼失誤？..."
-                  value={formData.notes}
-                  onChange={e=>setFormData({...formData, notes: e.target.value})}
-               />
+               <textarea className="w-full bg-slate-950 border border-slate-700 rounded p-3 text-sm h-32 focus:border-emerald-500 outline-none" placeholder="為什麼進場？執行上有什麼失誤？..." value={formData.notes} onChange={e=>setFormData({...formData, notes: e.target.value})}/>
             </div>
 
             <div className="border border-dashed border-slate-700 p-4 rounded hover:border-blue-500 cursor-pointer relative flex flex-col items-center justify-center h-24">
@@ -330,7 +354,7 @@ export default function Home() {
         <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800"><div className="text-slate-400 text-xs mb-1">Net PnL</div><div className={`text-2xl font-bold ${stats.totalPnl>=0?'text-emerald-400':'text-red-400'}`}>${stats.totalPnl.toLocaleString()}</div></div>
         <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800"><div className="text-slate-400 text-xs mb-1">Win Rate</div><div className="text-2xl font-bold text-blue-400">{stats.winRate.toFixed(1)}%</div></div>
         <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800"><div className="text-slate-400 text-xs mb-1">Trades</div><div className="text-2xl font-bold text-purple-400">{stats.totalTrades}</div></div>
-        <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800"><div className="text-slate-400 text-xs mb-1">Avg RR</div><div className="text-2xl font-bold text-yellow-400">{stats.avgRR.toFixed(2)}R</div></div>
+        <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800"><div className="text-slate-400 text-xs mb-1">Avg Actual RR</div><div className="text-2xl font-bold text-yellow-400">{stats.avgRR.toFixed(2)}R</div></div>
       </div>
 
       <div className="mb-8">
@@ -353,20 +377,6 @@ export default function Home() {
         </div>
       </div>
 
-      {Object.keys(strategyStats).length > 0 && (
-          <div className="mb-8">
-              <h2 className="text-slate-400 text-sm font-bold uppercase mb-4 flex items-center gap-2"><PieChart className="w-4 h-4"/> Strategy Performance</h2>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  {Object.entries(strategyStats).map(([name, stat]: any) => (
-                      <div key={name} className="bg-slate-900/80 border border-slate-800 p-4 rounded-lg flex justify-between items-center hover:border-slate-600 transition">
-                          <div><h4 className="text-sm font-bold text-white mb-1">{name}</h4><div className="text-xs text-slate-500">{stat.total} trades</div></div>
-                          <div className="text-right"><div className={`text-lg font-bold ${stat.pnl>=0?'text-emerald-400':'text-red-400'}`}>${stat.pnl.toLocaleString()}</div><div className="text-xs text-blue-400 font-mono">WR: {((stat.wins/stat.total)*100).toFixed(0)}%</div></div>
-                      </div>
-                  ))}
-              </div>
-          </div>
-      )}
-
       <div className="bg-slate-900/50 border border-slate-800 p-4 rounded-xl mb-8 relative">
         <div className="flex justify-between items-center mb-4">
             <h2 className="text-slate-300 font-bold flex items-center gap-2"><Activity className="w-4 h-4"/> Equity Curve</h2>
@@ -383,44 +393,38 @@ export default function Home() {
         <TradeChart data={getChartData()}/>
       </div>
 
-      <div className="bg-slate-900/50 border border-slate-800 p-4 rounded-xl mb-8">
-        <div className="flex justify-between cursor-pointer" onClick={()=>setShowCalendar(!showCalendar)}>
-           <h2 className="text-slate-300 font-bold flex items-center gap-2"><CalIcon className="w-4 h-4"/> PnL Calendar</h2>
-           <span className="text-slate-500 text-xs">{showCalendar?'Hide':'Show'}</span>
-        </div>
-        {showCalendar && (
-          <div className="grid grid-cols-7 gap-2 mt-4">
-            {Array.from({length: new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate()}, (_, i) => i + 1).map(d => {
-               const dateStr = `${new Date().getFullYear()}-${String(new Date().getMonth()+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`
-               const pnl = calendarData[dateStr]
-               return (
-                 <div key={d} className={`p-2 border border-slate-800 rounded min-h-[50px] flex flex-col items-center justify-center ${pnl ? (pnl>0?'bg-emerald-900/20':'bg-red-900/20') : 'bg-slate-950'}`}>
-                   <span className="text-xs text-slate-500">{d}</span>
-                   {pnl !== undefined && <span className={`text-xs font-bold ${pnl>0?'text-emerald-400':'text-red-400'}`}>{pnl}</span>}
-                 </div>
-               )
-            })}
-          </div>
-        )}
-      </div>
-
       <div className="bg-slate-900/50 border border-slate-800 rounded-xl overflow-hidden">
         <table className="w-full text-left text-sm">
-          <thead className="bg-slate-900 text-slate-400 text-xs uppercase"><tr><th className="p-4">Date</th><th className="p-4">Symbol</th><th className="p-4">Setup</th><th className="p-4">Note</th><th className="p-4 text-right">PnL</th><th className="p-4 text-center">Action</th></tr></thead>
+          <thead className="bg-slate-900 text-slate-400 text-xs uppercase"><tr><th className="p-4">Date</th><th className="p-4">Symbol</th><th className="p-4">Setup</th><th className="p-4">Note</th><th className="p-4 text-right">PnL / RR</th><th className="p-4 text-center">Action</th></tr></thead>
           <tbody className="divide-y divide-slate-800">
             {trades.map(t => (
               <tr key={t.id} className="hover:bg-slate-800/50">
                 <td className="p-4 text-slate-300">{t.entry_date}</td>
                 <td className="p-4 font-bold"><div>{t.symbol} <span className={t.direction==='LONG'?'text-emerald-400':'text-red-400'}>{t.direction}</span></div><div className="text-[10px] text-slate-500">{t.session}</div></td>
-                <td className="p-4 text-slate-300"><div className="text-blue-400 text-xs">{t.strategy_type?.split(' ')[0]}</div><div className="text-[10px] text-slate-400">{t.entry_model}</div></td>
+                <td className="p-4 text-slate-300">
+                    <div className="text-blue-400 text-xs">{t.strategy_type?.split(' ')[0]}</div>
+                    <div className="text-[10px] text-slate-400">{t.entry_model}</div>
+                    {/* 顯示該筆訂單的共振因素 */}
+                    {t.confluences && t.confluences.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-1">
+                            {t.confluences.map((c:string, i:number) => <span key={i} className="text-[8px] bg-slate-800 text-slate-400 px-1 rounded">{c}</span>)}
+                        </div>
+                    )}
+                </td>
                 <td className="p-4">
                     <div className="flex gap-2">
-                        {t.screenshot_url && <button onClick={()=>setSelectedImage(t.screenshot_url)} className="text-blue-400"><Eye className="w-4 h-4"/></button>}
-                        {t.notes && <button onClick={()=>setReadingNote(t.notes)} className="text-emerald-400"><BookOpen className="w-4 h-4"/></button>}
+                        {t.screenshot_url && <button onClick={()=>setSelectedImage(t.screenshot_url)} className="text-blue-400 hover:text-blue-300"><Eye className="w-4 h-4"/></button>}
+                        {t.notes && <button onClick={()=>setReadingNote(t.notes)} className="text-emerald-400 hover:text-emerald-300"><BookOpen className="w-4 h-4"/></button>}
                         {!t.screenshot_url && !t.notes && <span className="text-slate-600">-</span>}
                     </div>
                 </td>
-                <td className={`p-4 text-right font-bold ${t.pnl_net>0?'text-emerald-400':'text-red-400'}`}>{t.pnl_net}</td>
+                {/* 🔥 顯示 PnL 與 單筆 RR */}
+                <td className={`p-4 text-right font-bold ${t.pnl_net>0?'text-emerald-400':'text-red-400'}`}>
+                    <div>${t.pnl_net}</div>
+                    <div className={`text-[10px] font-mono ${t.actual_rr > 0 ? 'text-emerald-500/70' : 'text-red-500/70'}`}>
+                        {t.actual_rr ? `${t.actual_rr > 0 ? '+' : ''}${t.actual_rr.toFixed(2)}R` : '-'}
+                    </div>
+                </td>
                 <td className="p-4 text-center flex justify-center gap-2">
                   <button onClick={()=>{setEditingId(t.id); setFormData({...t}); setShowForm(true)}}><Edit className="w-4 h-4 text-slate-400 hover:text-blue-400"/></button>
                   <button onClick={()=>handleDelete(t.id)}><Trash2 className="w-4 h-4 text-slate-400 hover:text-red-400"/></button>
